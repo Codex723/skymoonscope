@@ -120,7 +120,7 @@ a dedicated worker.
 
 | File | Role |
 | --- | --- |
-| `public/wasm/wasmValidation.js` | The decoder — magic number, version, section walk, exports/imports |
+| `public/wasm/wasmValidation.js` | The decoder — magic number, version, section walk, exports/imports, data segments |
 | `public/wasm/wasmWorker.js` | Classic Web Worker wrapping the decoder |
 | `lib/wasmValidation.js` / `.d.ts` | Re-export so app code and tests share one implementation |
 | `hooks/useWasmValidationWorker.ts` | Lazily owns the worker, with a main-thread fallback |
@@ -153,3 +153,108 @@ happy path.
 `{ valid: false, errors: [...] }`, which is what crosses the message channel.
 Beyond magic number and version it walks every top-level section and decodes the
 export table, which is what `extractContractFunctions()` surfaces in the UI.
+
+### Fix: worker crash on custom name sections (issue #409)
+
+Soroban contracts compiled with debug info include a WASM custom section (id=0)
+with the name string `"name"` and function-name subsection data. These are
+larger, more realistic modules that triggered a latent boot-time crash in the
+worker.
+
+**Root cause.** `wasmWorker.js` originally contained this at the top level,
+outside `onmessage`:
+
+```js
+const { validateWasmModule } = self.SkyMoonScopeWasmValidation;
+```
+
+`importScripts('/wasm/wasmValidation.js')` runs synchronously just before this
+line and normally succeeds, populating `self.SkyMoonScopeWasmValidation`. But if
+`importScripts` ever failed — 404, CSP header, network hiccup in the worker
+scope — the destructure threw a `TypeError` at boot time, before `onmessage` was
+registered. The ping handshake in `useWasmValidationWorker` therefore never
+received a `pong`, the 2s timeout fired, and the hook silently fell back to the
+main thread. Uploads still worked but the off-thread benefit was lost and any
+future call with the dead worker would hang until fallback triggered again.
+
+**Fix.** The destructure (now `const api = self.SkyMoonScopeWasmValidation`) was
+moved inside `onmessage`, after the ping fast-path. The import is still attempted
+at boot so the happy path is unchanged; only `validate` calls need the API
+object. If it is absent they receive an `{ type: 'error', message: '...' }` reply
+rather than the worker dying silently.
+
+**Test fix.** `lib/wasmWorker.test.cjs` previously pre-populated
+`sandbox.SoroscopeWasmValidation` (wrong global name) and used a no-op
+`importScripts`. The sandbox now implements `importScripts` by running the
+requested script file through `vm.runInContext`, exactly mirroring the real
+worker boot sequence. Six regression tests were added covering the name-section
+scenario, non-ASCII function names in the name section, and the importScripts-
+failure graceful-error path.
+
+---
+
+## 5. WASM section summary panel (issue #408)
+
+After a WASM file is decoded, a collapsible panel appears below each file card
+in the upload list, giving a structured view of the module's binary contents.
+
+| File | Role |
+| --- | --- |
+| `components/WasmSectionSummary.tsx` | Collapsible panel component with four tabs |
+| `components/WasmSectionSummary.test.cjs` | Parser extension tests and panel logic tests |
+| `public/wasm/wasmValidation.js` | Extended with `parseDataSection` and fixed `parseImportSection` |
+| `lib/wasmValidation.d.ts` | New `WasmDataSegment` interface; `dataSegments` added to `WasmValidationReport` |
+
+### Panel structure
+
+`<WasmSectionSummaryPanel report={report} />` accepts a `WasmValidationReport`
+and renders a collapsible panel (closed by default) with four tabs:
+
+| Tab | Content |
+| --- | --- |
+| **Exports** | All exported symbols — name, kind (function / table / memory / global), index |
+| **Imports** | All imported symbols — module, name, kind |
+| **Data** | Data segment index, kind (active / passive), offset, byte length |
+| **Sections** | All top-level section IDs and sizes |
+
+Warnings from the decoder (e.g. "Module exports nothing") appear in an amber
+footer strip at the bottom of the open panel.
+
+The panel is integrated into `components/WasmUpload.tsx`: it mounts below the
+file card for every file whose status is `"success"` and whose `validation`
+report is available.
+
+### Parser extensions
+
+**`parseDataSection(bytes, start, end) → WasmDataSegment[]`** (new)
+
+Parses the data section (id = 11). Each segment records its kind
+(`"active"` / `"passive"` / `"unknown(n)"`), target memory index, offset
+constant (decoded from `i32.const <imm> end`; `null` for passive or complex
+offset expressions), and the byte length of the initialiser data. The raw bytes
+are not stored to keep the JSON report small.
+
+**`parseImportSection` (bug fix)**
+
+Previously the import parser stopped at the first non-function import kind
+(table / memory / global), because it only knew how to skip the one-byte type
+index that follows a function descriptor. Each descriptor kind now has its bytes
+correctly skipped (`skipImportDescriptor`), so all imports are decoded
+regardless of kind mix.
+
+### Types
+
+```ts
+interface WasmDataSegment {
+  index: number;
+  kind: 'active' | 'passive' | string;
+  memoryIndex: number | null;
+  offsetValue: number | null;
+  byteLength: number;
+}
+
+interface WasmValidationReport {
+  // ... existing fields ...
+  dataSegments: WasmDataSegment[];
+}
+```
