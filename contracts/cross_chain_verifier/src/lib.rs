@@ -40,6 +40,42 @@ pub struct Payload {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchMessage {
+    pub block_height: u32,
+    pub payload: Payload,
+    pub proof: Vec<BytesN<32>>,
+    pub proof_flags: Vec<bool>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedBatchMessage {
+    pub block_height: u32,
+    pub signed_message: SignedMessage,
+    pub proof: Vec<BytesN<32>>,
+    pub proof_flags: Vec<bool>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchVerificationResult {
+    pub total: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub failed_indices: Vec<u32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedBatchVerificationResult {
+    pub total: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub failed_indices: Vec<u32>,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
@@ -302,6 +338,121 @@ impl CrossChainVerifier {
             .persistent()
             .get(&DataKey::ProcessedNonce(nonce))
             .unwrap_or(false)
+    }
+
+    /// Verify multiple messages in a single batch call.
+    /// Reduces per-call overhead compared to individual verify_message calls.
+    pub fn verify_batch(
+        env: Env,
+        messages: Vec<BatchMessage>,
+    ) -> BatchVerificationResult {
+        if Self::is_paused(env.clone()) {
+            let mut failed_indices = Vec::new(&env);
+            for i in 0..messages.len() {
+                failed_indices.push_back(i);
+            }
+            return BatchVerificationResult {
+                total: messages.len(),
+                succeeded: 0,
+                failed: messages.len(),
+                failed_indices,
+            };
+        }
+
+        let mut succeeded = 0;
+        let mut failed_indices = Vec::new(&env);
+
+        for i in 0..messages.len() {
+            let msg = messages.get(i).unwrap();
+            
+            // Check if nonce already processed
+            if env.storage()
+                .persistent()
+                .has(&DataKey::ProcessedNonce(msg.payload.nonce))
+            {
+                // For batch verification, we return false instead of panicking
+                // to allow other messages in the batch to be processed
+                failed_indices.push_back(i);
+                continue;
+            }
+
+            let leaf = Self::compute_payload_hash(&env, &msg.payload);
+            if !Self::verify_merkle_proof(&env, &leaf, &msg.block_height, &msg.proof, &msg.proof_flags) {
+                failed_indices.push_back(i);
+                continue;
+            }
+
+            // Mark nonce as processed
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProcessedNonce(msg.payload.nonce), &true);
+            succeeded += 1;
+        }
+
+        BatchVerificationResult {
+            total: messages.len(),
+            succeeded,
+            failed: messages.len() - succeeded,
+            failed_indices,
+        }
+    }
+
+    /// Verify multiple signed messages in a single batch call.
+    /// Reduces per-call overhead compared to individual verify_signed_message calls.
+    pub fn verify_signed_batch(
+        env: Env,
+        messages: Vec<SignedBatchMessage>,
+    ) -> SignedBatchVerificationResult {
+        if Self::is_paused(env.clone()) {
+            let mut failed_indices = Vec::new(&env);
+            for i in 0..messages.len() {
+                failed_indices.push_back(i);
+            }
+            return SignedBatchVerificationResult {
+                total: messages.len(),
+                succeeded: 0,
+                failed: messages.len(),
+                failed_indices,
+            };
+        }
+
+        let mut succeeded = 0;
+        let mut failed_indices = Vec::new(&env);
+
+        for i in 0..messages.len() {
+            let msg = messages.get(i).unwrap();
+            
+            // Check signature
+            if !Self::verify_signature(&env, &msg.signed_message) {
+                failed_indices.push_back(i);
+                continue;
+            }
+
+            let message_hash = Self::hash_message(&env, &msg.signed_message.message);
+            let processed_key = DataKey::ProcessedMessages(message_hash.clone());
+            
+            // Skip if message already processed
+            if env.storage().persistent().has(&processed_key) {
+                failed_indices.push_back(i);
+                continue;
+            }
+
+            if !Self::verify_merkle_proof(&env, &message_hash, &msg.block_height, &msg.proof, &msg.proof_flags) {
+                failed_indices.push_back(i);
+                continue;
+            }
+
+            // Mark message as processed
+            env.storage().persistent().set(&processed_key, &true);
+            succeeded += 1;
+        }
+
+        SignedBatchVerificationResult {
+            total: messages.len(),
+            succeeded,
+            failed: messages.len() - succeeded,
+            failed_indices,
+        }
     }
 
     /// RFC 6962 Merkle inclusion proof.

@@ -1,8 +1,9 @@
 #![cfg(test)]
 
 use crate::{
-    CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, Payload, SignatureAlgorithm,
-    SignedMessage, LEAF_PREFIX, MAX_PROOF_LENGTH, NODE_PREFIX,
+    BatchMessage, BatchVerificationResult, CrossChainMessage, CrossChainVerifier,
+    CrossChainVerifierClient, Payload, SignatureAlgorithm, SignedBatchMessage,
+    SignedBatchVerificationResult, SignedMessage, LEAF_PREFIX, MAX_PROOF_LENGTH, NODE_PREFIX,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
@@ -19,13 +20,16 @@ fn make_payload(env: &Env, nonce: u64) -> Payload {
     }
 }
 
-fn merkle_hash_pair(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    crate::merkle_node_hash(env, left, right)
-}
+
 
 /// The leaf value the contract is asked to prove inclusion of: the payload hash.
 fn raw_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
     CrossChainVerifier::compute_payload_hash(env, payload)
+}
+
+/// Helper function for tests (alias for raw_leaf)
+fn compute_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
+    raw_leaf(env, payload)
 }
 
 /// `SHA256(0x00 || data)` — the RFC 6962 leaf hash (issue #076).
@@ -1169,4 +1173,320 @@ fn test_mismatched_flag_length_is_rejected() {
     let empty_flags = Vec::new(&env);
 
     assert!(!client.verify_message_and_consume(&3, &1u64, &leaf, &proof, &empty_flags));
+}
+
+// ============================================================================
+// Batch Verification Tests
+// ============================================================================
+
+#[test]
+fn test_verify_batch_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let block_height = 100;
+    
+    // Create test data for 3 messages
+    let mut batch_messages = Vec::new(&env);
+    
+    for i in 0..3 {
+        let payload = Payload {
+            chain_id: 1,
+            destination_contract: Address::generate(&env),
+            nonce: i as u64,
+            data: Bytes::from_slice(&env, &[i as u8; 32]),
+        };
+        
+        let leaf = CrossChainVerifier::compute_payload_hash(&env, &payload);
+        let sibling = BytesN::from_array(&env, &[i as u8 + 10; 32]);
+        
+        // Single node tree: leaf hash is root
+        let root_arr = hash_leaf(&env, &leaf.to_array());
+        let root = BytesN::from_array(&env, &root_arr);
+        client.update_root(&(block_height + i), &root);
+        
+        let mut proof = Vec::new(&env);
+        let mut proof_flags = Vec::new(&env);
+        
+        batch_messages.push_back(BatchMessage {
+            block_height: block_height + i,
+            payload,
+            proof,
+            proof_flags,
+        });
+    }
+    
+    let result = client.verify_batch(&batch_messages);
+    assert_eq!(result.total, 3);
+    assert_eq!(result.succeeded, 3);
+    assert_eq!(result.failed, 0);
+    assert_eq!(result.failed_indices.len(), 0);
+}
+
+#[test]
+fn test_verify_batch_partial_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let block_height = 200;
+    
+    // Create test data for 4 messages, 2 will fail
+    let mut batch_messages = Vec::new(&env);
+    
+    for i in 0..4 {
+        let payload = Payload {
+            chain_id: 1,
+            destination_contract: Address::generate(&env),
+            nonce: i as u64,
+            data: Bytes::from_slice(&env, &[i as u8; 32]),
+        };
+        
+        let leaf = CrossChainVerifier::compute_payload_hash(&env, &payload);
+        
+        // Messages 0 and 1 will succeed (valid root), 2 and 3 will fail (no root)
+        if i < 2 {
+            let root_arr = hash_leaf(&env, &leaf.to_array());
+            let root = BytesN::from_array(&env, &root_arr);
+            client.update_root(&(block_height + i), &root);
+        }
+        
+        let mut proof = Vec::new(&env);
+        let mut proof_flags = Vec::new(&env);
+        
+        batch_messages.push_back(BatchMessage {
+            block_height: block_height + i,
+            payload,
+            proof,
+            proof_flags,
+        });
+    }
+    
+    let result = client.verify_batch(&batch_messages);
+    assert_eq!(result.total, 4);
+    assert_eq!(result.succeeded, 2);
+    assert_eq!(result.failed, 2);
+    assert_eq!(result.failed_indices.len(), 2);
+    assert_eq!(result.failed_indices.get(0).unwrap(), 2);
+    assert_eq!(result.failed_indices.get(1).unwrap(), 3);
+}
+
+#[test]
+fn test_verify_batch_replay_protection() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let block_height = 300;
+    let payload = Payload {
+        chain_id: 1,
+        destination_contract: Address::generate(&env),
+        nonce: 1,
+        data: Bytes::from_slice(&env, b"test"),
+    };
+    
+    let leaf = CrossChainVerifier::compute_payload_hash(&env, &payload);
+    let root_arr = hash_leaf(&env, &leaf.to_array());
+    let root = BytesN::from_array(&env, &root_arr);
+    client.update_root(&block_height, &root);
+    
+    let mut proof = Vec::new(&env);
+    let mut proof_flags = Vec::new(&env);
+    
+    let message = BatchMessage {
+        block_height,
+        payload: payload.clone(),
+        proof,
+        proof_flags,
+    };
+    
+    // First batch succeeds
+    let mut batch1 = Vec::new(&env);
+    batch1.push_back(message.clone());
+    let result1 = client.verify_batch(&batch1);
+    assert_eq!(result1.succeeded, 1);
+    
+    // Second batch with same nonce should fail due to replay protection
+    let mut batch2 = Vec::new(&env);
+    batch2.push_back(message);
+    let result2 = client.verify_batch(&batch2);
+    assert_eq!(result2.succeeded, 0);
+    assert_eq!(result2.failed, 1);
+}
+
+#[test]
+fn test_verify_signed_batch_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    // Add authorized signer
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let public_key = Bytes::from_slice(&env, &verifying_key.to_bytes());
+    client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519);
+
+    let block_height = 400;
+    
+    // Create test data for 2 signed messages
+    let mut batch_messages = Vec::new(&env);
+    
+    for i in 0..2 {
+        let message = CrossChainMessage {
+            source_chain: 1,
+            destination_chain: 2,
+            nonce: i as u64,
+            payload: Bytes::from_slice(&env, &[i as u8; 32]),
+            timestamp: 1000 + i as u64,
+        };
+        
+        let message_hash: BytesN<32> = {
+            let mut data = Bytes::new(&env);
+            data.append(&Bytes::from_slice(&env, b"CROSS_CHAIN_MESSAGE_V1"));
+            data.append(&Bytes::from_slice(&env, &message.source_chain.to_be_bytes()));
+            data.append(&Bytes::from_slice(&env, &message.destination_chain.to_be_bytes()));
+            data.append(&Bytes::from_slice(&env, &message.nonce.to_be_bytes()));
+            data.append(&Bytes::from_slice(&env, &message.timestamp.to_be_bytes()));
+            let payload_hash = env.crypto().sha256(&message.payload).to_array();
+            data.append(&Bytes::from_slice(&env, &payload_hash));
+            BytesN::from_array(&env, &env.crypto().sha256(&data).to_array())
+        };
+        
+        let signature = signing_key.sign(&message_hash.to_array());
+        
+        let signed_message = SignedMessage {
+            message: message.clone(),
+            signature: BytesN::from_array(&env, &signature.to_bytes()),
+            signer_public_key: BytesN::from_array(&env, &verifying_key.to_bytes()),
+            algorithm: SignatureAlgorithm::Ed25519,
+        };
+        
+        // Create merkle proof
+        let root_arr = hash_leaf(&env, &message_hash.to_array());
+        let root = BytesN::from_array(&env, &root_arr);
+        client.update_root(&(block_height + i), &root);
+        
+        let mut proof = Vec::new(&env);
+        let mut proof_flags = Vec::new(&env);
+        
+        batch_messages.push_back(SignedBatchMessage {
+            block_height: block_height + i,
+            signed_message,
+            proof,
+            proof_flags,
+        });
+    }
+    
+    let result = client.verify_signed_batch(&batch_messages);
+    assert_eq!(result.total, 2);
+    assert_eq!(result.succeeded, 2);
+    assert_eq!(result.failed, 0);
+    assert_eq!(result.failed_indices.len(), 0);
+}
+
+#[test]
+fn test_verify_batch_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let block_height = 500;
+    let payload = Payload {
+        chain_id: 1,
+        destination_contract: Address::generate(&env),
+        nonce: 1,
+        data: Bytes::from_slice(&env, b"test"),
+    };
+    
+    let leaf = CrossChainVerifier::compute_payload_hash(&env, &payload);
+    let root_arr = hash_leaf(&env, &leaf.to_array());
+    let root = BytesN::from_array(&env, &root_arr);
+    client.update_root(&block_height, &root);
+    
+    let mut proof = Vec::new(&env);
+    let mut proof_flags = Vec::new(&env);
+    
+    let mut batch_messages = Vec::new(&env);
+    batch_messages.push_back(BatchMessage {
+        block_height,
+        payload,
+        proof,
+        proof_flags,
+    });
+    
+    // Pause verification
+    client.set_paused(&true);
+    
+    let result = client.verify_batch(&batch_messages);
+    assert_eq!(result.total, 1);
+    assert_eq!(result.succeeded, 0);
+    assert_eq!(result.failed, 1);
+    assert_eq!(result.failed_indices.len(), 1);
+    assert_eq!(result.failed_indices.get(0).unwrap(), 0);
+}
+
+#[test]
+fn test_verify_batch_large_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let block_height = 600;
+    let mut batch_messages = Vec::new(&env);
+    
+    // Test with 10 messages (reasonable batch size)
+    for i in 0..10 {
+        let payload = Payload {
+            chain_id: 1,
+            destination_contract: Address::generate(&env),
+            nonce: i as u64,
+            data: Bytes::from_slice(&env, &[i as u8; 32]),
+        };
+        
+        let leaf = CrossChainVerifier::compute_payload_hash(&env, &payload);
+        let root_arr = hash_leaf(&env, &leaf.to_array());
+        let root = BytesN::from_array(&env, &root_arr);
+        client.update_root(&(block_height + i), &root);
+        
+        let mut proof = Vec::new(&env);
+        let mut proof_flags = Vec::new(&env);
+        
+        batch_messages.push_back(BatchMessage {
+            block_height: block_height + i,
+            payload,
+            proof,
+            proof_flags,
+        });
+    }
+    
+    let result = client.verify_batch(&batch_messages);
+    assert_eq!(result.total, 10);
+    assert_eq!(result.succeeded, 10);
+    assert_eq!(result.failed, 0);
+    assert_eq!(result.failed_indices.len(), 0);
 }

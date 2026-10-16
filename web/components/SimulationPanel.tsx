@@ -102,12 +102,17 @@ export function SimulationPanelSidebar() {
     contractId,
     setContractId,
     wasmFile,
+    currentResult,
     selectedFunction,
     setSelectedFunction,
     setCurrentResult,
     loading,
     handleSimulate,
   } = useSimulation();
+
+  // After a page refresh the in-memory File object is gone, but the last
+  // analysis result (which includes wasmFileName) is restored from storage.
+  const activeWasmName = wasmFile?.name ?? currentResult?.wasmFileName ?? null;
 
   return (
     <>
@@ -156,7 +161,7 @@ export function SimulationPanelSidebar() {
         <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: '#8b949e' }}>
           Contract ID: <code style={{ color: '#00d9ff' }}>{contractId.substring(0, 20)}...</code>
         </p>
-        {wasmFile && (
+        {activeWasmName && (
           <div
             style={{
               marginTop: '16px',
@@ -169,8 +174,13 @@ export function SimulationPanelSidebar() {
             }}
           >
             <span style={{ color: '#34d399', fontSize: '12px', fontWeight: '600' }}>Active WASM:</span>
-            <code style={{ color: '#c9d1d9', fontSize: '12px', fontFamily: 'monospace' }}>{wasmFile.name}</code>
-            <span style={{ color: '#8b949e', fontSize: '11px' }}>({(wasmFile.size / 1024).toFixed(1)} KB)</span>
+            <code style={{ color: '#c9d1d9', fontSize: '12px', fontFamily: 'monospace' }}>{activeWasmName}</code>
+            {wasmFile && (
+              <span style={{ color: '#8b949e', fontSize: '11px' }}>({(wasmFile.size / 1024).toFixed(1)} KB)</span>
+            )}
+            {!wasmFile && (
+              <span style={{ color: '#8b949e', fontSize: '11px' }}>(restored)</span>
+            )}
           </div>
         )}
       </div>

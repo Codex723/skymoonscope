@@ -119,6 +119,9 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
   const { history, addToHistory } = useInvocationHistory();
 
   useEffect(() => {
+    // loadLatestAnalysis is synchronous (plain localStorage). The result
+    // already has wasmFileName embedded, so the sidebar can display the
+    // contract name even though the File object is not available after refresh.
     const restored = loadLatestAnalysis();
     if (restored) {
       setCurrentResult(restored);
@@ -172,6 +175,9 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
       const result: InvocationResult = {
         id: Math.random().toString(36).slice(2),
         functionName: selectedFunction.name,
+        // Persist the WASM filename so the sidebar can show it after a refresh,
+        // when the in-memory File object is no longer available.
+        wasmFileName: wasmFile?.name,
         inputs,
         result: generateMockResult(selectedFunction.name, inputs),
         analysisReport: report,
@@ -214,6 +220,7 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
 
   const handleClearAnalysis = useCallback(() => {
     setCurrentResult(null);
+    setWasmFile(null);
     setWasmData(null);
     clearLatestAnalysis();
     setUploadResetKey((k) => k + 1);
